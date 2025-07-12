@@ -35,24 +35,24 @@ components:
     file.  Through use of this file and the experiment_v3.py, data is collected and 
     saved to SQLite database files.  These are organized by their dates of creation.
 
-3) `plotting_v3.py`
+3) `formatting_v3.py`
     This file is used to cleanly access the SQLite database files and create basic 
     plots of the data.  One such python file has been used to do this plotting in the 
     past by Niyaz and Camille, but I aim to format things a little differently more to
-    my taste with this version of the plotting code.  In particular, I plan to change
-    how the meta-data is presented to align with my previous NV-center setup.  One 
-    important advantage of having the plotting separate from the acquisition notebook 
-    is that this method of calling from the saved database files necessitates the data
-    being saved correctly before plotting occurs.
+    my taste with this version of the plotting code.  In particular, I changed how the 
+    meta-data is presented to a table format more in line with my previous NV-center
+    setup.  One important advantage of having the plotting separate from the
+    acquisition notebook is that this method of calling from the saved database files 
+    necessitates the data being saved correctly before plotting occurs.
 
+4) `plotting_v3.ipynb`
+    Like that of the acquisition file being the front-face of the experiment_v3 code,
+    this file is that front-face of the formatting_v3 code.  Here is where I will form
+    plots of the database files.  I am working on adding analysis like quality factor
+    extraction to the formatting and plotting files.  My hope is to wrap most of that 
+    analysis into these two files.
 
 ## Components I Will Add
-
-4) `analysis_v3.ipynb`
-    Like that of the acquisition file being the front-face of the experiment_v3 code,
-    this file is that front-face of the plotting_v3 code.  Here is where I will format
-    plots of the database files.  It is also possible that I conduct some simulation
-    in this python notebook.
 
 5) `drivers/`
     The last component of this code being fully useable is adding the drivers called 
