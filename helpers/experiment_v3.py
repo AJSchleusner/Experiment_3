@@ -32,11 +32,12 @@ import os.path
 import os
 import logging
 import pyvisa
+import sqlite3
+import pandas as pd
 
 from time import sleep, strftime
 from tabulate import tabulate
 from tqdm import tqdm
-from helpers.database2 import Create_DB
 from newinstruments.BlueFors import BlueFors
 bluefors = BlueFors()
 from plot_setup import live_plot as lp
@@ -191,6 +192,148 @@ def show_connection_table(status_list):
 
 
 ###########################################################################################
+## Database Class ---------------------------------------------------------------------- ##
+###########################################################################################
+
+# Create the database class
+class Create_DB():
+    # Create the initializer method for the class. This method is called when an instance
+    # of the class is created. 
+    def __init__(self, filename, sweep: dict, step: dict, measured: list, metadata: list):
+        # Connect to the SQLite database file. If the file does not exist, create it.
+        self.conn = sqlite3.connect(filename)
+        self.cursor = self.conn.cursor()
+        # Store the sweep, step, measured data, and metadata as class attributes
+        self.sweep = sweep
+        self.step = step
+        self.measured = measured
+        self.metadata = metadata
+        # Set the database structure and write the initial data to the database
+        with self.conn:
+            self.set_db_structure()
+            self.initial_write()
+
+    # Create the tables in the database based on the provided dictionary.
+    def create_table(self, tablename: str, dict: dict):
+        # Dictionary keys are the column headers over the data values
+        params_list = dict.get('params')
+        types_list = dict.get('types')
+        key_string = "("
+        for param, type in zip(params_list, types_list):
+            key_string = key_string + f"{param} {type}, "
+        key_string = key_string[:-2] + ")"
+        stmt = f"CREATE TABLE {tablename} {key_string}"    
+        self.cursor.execute(stmt)
+
+    # This method sets the structure of the database by creating the necessary tables.
+    def set_db_structure(self) -> None:
+        """
+        the structure of the database will be as follows:
+
+        5 tables:
+        table 1: experiment condition [run/stop]
+        table 2: sweep parameters [sweep_index, sweep_value, ...]
+        table 3: step parameters [step_index, step_value, ...]
+        table 4: measured data [sweep_index, step_index, data_values, ...]
+        table 5: metadata [all experiment class attributes]
+        """
+
+        # Store whether the experiment is running or stopped.  I generally haven't found
+        # any purpose in the 'table_cond' part of the saved databases.
+        dict_exp_cond = {'params': ['exp_cond'],'types': ['TEXT']}
+        self.create_table('table_cond', dict_exp_cond)
+
+        # Create the sweep table from the sweep parameters.
+        dict_sweep = {
+            'params': self.sweep.get('variable'),
+            'types': ['REAL'] * len(self.sweep.get('variable'))}
+        self.create_table('table_sweep', dict_sweep)
+
+        # Create the step table from the step parameters (if a step exists)
+        step_params = self.step.get('variable')
+        if step_params:  # Only create table if step variables are defined
+            dict_step = {
+                'params': step_params,
+                'types': ['REAL'] * len(step_params)}
+            self.create_table('table_step', dict_step)
+        # Create the measurement data table with step and sweep indices
+        measurement_name = ['step_index', 'sweep_index']
+        measurement_type = ['INTEGER'] * 2
+        measurement_name.extend(self.measured)
+        measurement_type.extend(['REAL'] * (len(self.measured)))
+        # Create the table with the measurement data
+        dict_measured = {'params': measurement_name, 'types': measurement_type}
+        self.create_table('table_data', dict_measured)
+
+        # Create the metadata table with all experiment class attributes
+        dict_metadata = {
+            'params': [item[0] for item in self.metadata],
+            'types': ['TEXT'] * len(self.metadata)}
+        self.create_table('table_info', dict_metadata)
+
+    # Insert data into the table for all columns in the table for multiple rows at once.
+    def insert_data_many(self, tablename: str, data: list) -> None:
+        num = len(data[0])
+        # SQL statement to:
+        # 1 - set f-string to table name
+        # 2 - set number of ? placeholders based on the number of columns
+        # 3 - close the list 
+        stmt = f"INSERT INTO {tablename} VALUES({','.join(['?'] * num)})"
+        self.cursor.executemany(stmt, data)
+        # commit the changes to the database
+        self.conn.commit()
+
+    # Initial writing to the tables to set them up for later population with data.
+    def initial_write(self) -> None:
+        # Insert 'run' to the condition table
+        self.insert_data_many('table_cond', [('run',)])
+        # Batch insert sweep points
+        sweep_lists = self.sweep.get('sweep lists')
+        sweep_data = [tuple([sweep_lists[j][i] for j in range(len(sweep_lists))])
+                      for i in range(len(sweep_lists[0]))]
+        self.insert_data_many('table_sweep', sweep_data)
+        # If there is step data, batch insert step points
+        step_lists = self.step.get('step lists')
+        if step_lists and len(step_lists) > 0:
+            step_data = [tuple([step_lists[j][i] for j in range(len(step_lists))])
+                        for i in range(len(step_lists[0]))]
+            self.insert_data_many('table_step', step_data)
+        # Insert metadata into the table_info table
+        meta_row = [str(item[1]) if not isinstance(item[1], tuple) else item[1]
+                     for item in self.metadata]
+        self.insert_data_many('table_info', [tuple(meta_row)])
+
+    # Wrapper for insert_data_many
+    def measurement_write_many(self, tablename: str, data) -> None:
+        with self.conn:
+            self.insert_data_many(tablename, data)
+
+    # This adds a new column to a table in the database with the specified name.
+    def add_col_to_table(self, tablename: str, column_name: str):
+        stmt = f"ALTER TABLE {tablename} ADD COLUMN {column_name} REAL"
+        self.cursor.execute(stmt)
+
+    # This retrieves data from the database for live plotting
+    def get_data_live_plot(self, index1 = None, index2 = None, index2a = None, index2b = None, index3 = None):
+        sweep = self.cursor.execute(f"SELECT * from {'table_sweep'}").fetchall()
+        sweep = np.array(sweep)  # Convert list to NumPy array
+        sweep = sweep[0:index1, :]  # Perform slicing
+        step  = self.cursor.execute(f"SELECT * from {'table_step'}").fetchall()
+        step  = np.array(step)  # Convert list to NumPy array
+        step  = step[index2a:(index2 + index2a + 1), index2b]  # Perform slicing
+        data  = self.cursor.execute(f"SELECT * from {'table_data'}").fetchall()
+        data  = np.array(data)  # Convert list to NumPy array
+        data  = data[0:index3, :]  # Perform slicing
+        return sweep, step, data
+
+    # Code for closing the database connection and adding 'stop' to the condition table.
+    def sql_close(self):
+        with self.conn:
+            self.insert_data_many('table_cond', [('stop',)])
+        self.conn.close()
+
+
+###########################################################################################
 ## Data Management --------------------------------------------------------------------- ##
 ###########################################################################################
 
@@ -306,27 +449,20 @@ def apply_control(device, method_name, value):
     else:
         setattr(device, method_name, value)
 
-
-# Insert sweep_data into the database
-def write_sweep_to_database(sqldb, sweep_data, step_indices):
+def write_to_database(sqldb, sweep_data, step_indices):
     """
-    Parameters:
-        sqldb          : The active Create_DB instance.
-        sweep_data     : List of measurement rows (data only).
-        step_indices   : Optional. If provided, must be same length as sweep_data.
-                         Maps each row to its step index in a 2D sweep.
+    Efficiently insert sweep_data into the database with optional step indexing.
     """
-    # Enumerate over the sweep_data to get the index and row data
-    for sweep_index, row in tqdm(enumerate(sweep_data),total=len(sweep_data),
-                                 desc='Saving to Database'):
-        # 1D case: set step_index = 0
-        if step_indices is None:
-            step_index = 0
-        else:
-            step_index = step_indices[sweep_index]
-        # Create a full row with sweep_index, step_index, and the row data
+    all_rows = []
+    for sweep_index, row in enumerate(sweep_data):
+        step_index = step_indices[sweep_index] if step_indices is not None else 0
         full_row = (step_index, sweep_index) + tuple(row)
-        sqldb.insert_data_byrow('table_data', full_row)
+        all_rows.append(full_row)
+    # Use batch insertion
+    with sqldb.conn:  # Automatically handles commit
+        sqldb.cursor.executemany(
+            "INSERT INTO table_data VALUES (?, ?, " + ", ".join(["?"] * len(sweep_data[0])) + ")", 
+            all_rows)
 
 
 ###########################################################################################   
@@ -597,9 +733,7 @@ class exp3():
    
     # This function creates a new SQLite database for the experiment with the given name
     # and data columns.  Of note is that the " -> Create_DB" indicates that this function
-    # will return an instance of the Create_DB class, which is defined in the separate
-    # database2.py file.
-
+    # will return an instance of the Create_DB class.
     def create_sqldb(self, exp_name: str, data_columns: list) -> Create_DB:
         """
         Creates a new SQLite database file for storing sweep results.
@@ -686,9 +820,9 @@ class exp3():
         vna.set_average_state(not avs)
         vna.set_average_state(avs)
         # Let the VNA collect data for the length of time necessary for a full sweep
-        # (with possible averaging). The factor of 1.2 is just a safety factor to ensure
+        # (with possible averaging). The factor of 1.05 is just a safety factor to ensure
         # the VNA has enough time to collect the data we specifically want. 
-        sleep(1.2*vsleep)
+        sleep(1.05*vsleep)
 
     # This function pulls the VNA data from the read_dict and returns it as a list.
     def pull_vna_data(self, read_dict):
@@ -960,6 +1094,12 @@ class exp3():
         sweep_data = []
         # Unpack the number of frequency points 
         num_pts = num_sweep_points[0]
+        # Ensure VNA output is ON before measurement
+        if hasattr(vna, "set_output"):
+            vna.set_output(True)
+        # Turn on the vna averaging
+        if hasattr(vna, "set_average_state"):
+            vna.set_average_state(True)
         # Handle the 'freq_range' keyword as a special no-sweep case
         if sweep_var == 'freq_range':
             # S1 will be the start frequency
@@ -990,11 +1130,15 @@ class exp3():
                 step_index = np.full_like(freq_index, step_val)
             step_index = step_index[:, None]  # Ensure step_index is 2D
             stacked = np.hstack((step_index, freq_index[:, None], vna_arr))
+            # Turn off the VNA power
+            if hasattr(vna, "set_output"):
+                vna.set_output(False)
             return stacked.tolist()
         # Sweeping one parameter (power, delay, etc.)
         val0, instr, task, units = sweep_controls[sweep_var]
         for val in tqdm(sweep_list, desc=f'Sweeping {sweep_var}', leave=False):
             apply_control(instr, task, val)
+
             self.vna_meas_wait(vna)
             vna_arr = self.pull_vna_data(read_dict)
             vna_arr = np.array(vna_arr).T  # Transpose to match frequency points
@@ -1003,6 +1147,9 @@ class exp3():
             sweep_index = np.full((len(freq_pts), 1), val) 
             stacked = np.hstack((freq_index, sweep_index, vna_arr))
             sweep_data.extend(stacked.tolist())
+        # Turn off the VNA power    
+        if hasattr(vna, "set_output"):
+            vna.set_output(False)
         return sweep_data
 
 
@@ -1291,7 +1438,7 @@ class exp3():
             # Create the database 
             sqldb = self.create_sqldb(exp_name, columns)
             # Save the sweep_data to the database 
-            write_sweep_to_database(sqldb, sweep_data, step_indices)
+            write_to_database(sqldb, sweep_data, step_indices)
             # End the connection to the database
             self.close_sqldb(sqldb)
             print('Data saved to database')
