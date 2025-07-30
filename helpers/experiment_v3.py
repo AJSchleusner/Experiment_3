@@ -453,16 +453,144 @@ def write_to_database(sqldb, sweep_data, step_indices):
     """
     Efficiently insert sweep_data into the database with optional step indexing.
     """
+    # Sanitize the row data to handle complex numbers
+    def sanitize_row(row):
+        clean = []
+        for val in row:
+            if isinstance(val, complex):
+                clean.extend([val.real, val.imag])
+            else:
+                clean.append(val)
+        return tuple(clean)
+    # Prepare the data for insertion
     all_rows = []
     for sweep_index, row in enumerate(sweep_data):
         step_index = step_indices[sweep_index] if step_indices is not None else 0
         full_row = (step_index, sweep_index) + tuple(row)
-        all_rows.append(full_row)
+        sanitized = sanitize_row(full_row)
+        all_rows.append(sanitized)
     # Use batch insertion
-    with sqldb.conn:  # Automatically handles commit
-        sqldb.cursor.executemany(
-            "INSERT INTO table_data VALUES (?, ?, " + ", ".join(["?"] * len(sweep_data[0])) + ")", 
-            all_rows)
+    sql = "INSERT INTO table_data VALUES (" + ", ".join(["?"] * len(all_rows[0])) + ")"
+    with sqldb.conn:
+        sqldb.cursor.executemany(sql, all_rows)
+
+
+
+
+
+
+
+
+
+
+
+###########################################################################################   
+## VNA Format Class -------------------------------------------------------------------- ##
+###########################################################################################
+
+class VNAFormatRouter:
+    def __init__(self, format_key):
+        self.format_key = format_key.strip().upper()
+        self.format_map = {
+            'MLOG': {
+                'scpi': 'MLOG',
+                'mode': 'scalar',
+                'read_dict': lambda vna: {'vna_mag': [vna, 'read_data_y', 'dB']},
+                'reshape': lambda data, vna: np.hstack((
+                    np.array(data).T,
+                    vna.get_fpoints()[:, None])),
+                'columns': ['vna_mag', 'vna_freq'],
+                'units':   ['dB', 'Hz']
+            },
+            'PHAS': {
+                'scpi': 'PHAS',
+                'mode': 'scalar',
+                'read_dict': lambda vna: {'vna_phase': [vna, 'read_data_y', 'deg']},
+                'reshape': lambda data, vna: np.hstack((
+                    np.array(data).T,
+                    vna.get_fpoints()[:, None])),
+                'columns': ['vna_phase', 'vna_freq'],
+                'units':   ['deg', 'Hz']
+            },
+            'POL': {
+                'scpi': 'POL',
+                'mode': 'polar',
+                'read_dict': lambda vna: {
+                    'vna_mag': [vna, 'read_data_y', 'dB'],
+                    'vna_phase': [vna, 'read_data_y', 'deg']
+                },
+                'reshape': lambda data, vna: np.hstack((
+                    np.array(data).T, vna.get_fpoints()[:, None])),
+                'columns': ['vna_mag', 'vna_phase', 'vna_freq'],
+                'units': ['dB', 'deg', 'Hz']
+            },
+            'SDATA': {
+                'scpi': None,
+                'mode': 'complex',
+                'read_dict': lambda vna: {
+                    'vna_complex': [vna, 'read_complex', '']
+                },
+                'reshape': lambda data, vna: np.hstack((
+                    np.vstack((data.real, data.imag)).T,
+                    vna.get_fpoints()[:, None])),
+                'columns': ['vna_real', 'vna_imag', 'vna_freq'],
+                'units':   ['', '', 'Hz']
+            }
+        }
+
+        self.config = self.format_map.get(self.format_key, self.format_map['MLOG'])
+
+    # This method applies the SCPI format to the VNA instrument, if one is present
+    def apply_format(self, vna):
+        scpi_format = self.config['scpi']
+        if scpi_format:
+            vna.set_format(scpi_format)
+
+    def get_read_dict(self, vna):
+        return self.config['read_dict'](vna)
+
+    def reshape_data(self, data, vna):
+        return self.config['reshape'](np.asarray(data), vna)
+
+    def get_mode(self):
+        return self.config['mode']
+
+    def get_columns(self):
+        return self.config.get('columns', ['vna_data'])
+
+    def get_units(self):
+        return self.config.get('units', [''])
+
+    def get_metadata_dict(self):
+        return {
+            'format': self.format_key,
+            'mode': self.get_mode(),
+            'columns': self.get_columns(),
+            'units': self.get_units()
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 ###########################################################################################   
@@ -787,27 +915,6 @@ class exp3():
         # Automatically scale the VNA y axis 
         vna.auto_scale(channel = 1)
         return avstate, vsleep
-
-    # Function to define the VNA data columns depending on the format
-    def vna_data_info(self,vna=None):
-        if vna is None:
-            vna = self.__vna['instrument']
-        form_val = vna.get_format()
-        # Format options are:
-        # MLOGarithmic | PHASe        | GDELay 
-        # SLINear      | SLOGarithmic | SCOMplex
-        # SMITh        | SADMittance  | PLINear
-        # PLOGarithmic | POLar        | MLINear
-        # SWR          |REAL          | IMAGinary
-        # UPHase       |PPHase
-        # These can be selected with the vna's set_format() method
-
-        # Check if the format is one of the VNA data formats that requires two data columns
-        if any(s in form_val for s in ['SMIT', 'POL', 'SADM']):
-            vna_dat_items = ['VNA1', 'VNA2']
-        else:
-            vna_dat_items = ['VNA1']
-        return vna_dat_items
     
     # Prepare the VNA for measurement by setting the averaging state and waiting for the
     # sweep to complete. 
@@ -893,7 +1000,7 @@ class exp3():
     ## Initialize For an Experiment Run ------------------------------------------------ ##
     #######################################################################################
 
-    def init_reads(self, printing=False):
+    def init_reads(self, printing=False, format_router=None):
         # Since the instrument 'vna' is called explcitly in this function, this check was
         # added to ensure that the vna instrument is named exactly 'vna' before being
         # called to in this function.  If it is not defined, an error is raised.
@@ -930,6 +1037,11 @@ class exp3():
         except:  # There may not be a step instrument used
             step_type = None
 
+        # Convert string to a router object
+        if format_router:
+            format_router = VNAFormatRouter(format_router) 
+
+
 
         ###################################################################################
         ## Sweep and Step Combinations ------------------------------------------------- ##
@@ -945,8 +1057,8 @@ class exp3():
         elif sweep_type == 'vna' and step_type is None:
             # Create a dictionary of only the read instruments that include 'vna'
             read_keys = [key for key in self.__reads if 'vna' in key]
-            read_dict = {key: self.__reads.get(key) for key in read_keys}
-            read_list = self.vna_data_info(vna)
+            read_dict = format_router.get_read_dict(vna)
+            read_list = list(read_dict.keys())
         # 2D transport sweep ------------------------------------------------------------ #
         elif sweep_type == 'transport' and step_type == 'transport':
             # Create a dictionary of only the read instruments that do not
@@ -955,24 +1067,17 @@ class exp3():
             read_dict = {key: self.__reads.get(key) for key in read_keys}
             read_list = list(read_dict.keys())
         # 2D hybrid sweep --------------------------------------------------------------- #
-        elif sweep_type == 'transport' and step_type == 'vna':
-            # Create a dictionary of all read instruments
-            read_dict = {key: self.__reads.get(key) for key in self.__reads}
-            read_list = list(read_dict.keys()) + self.vna_data_info(vna)
         elif sweep_type == 'vna' and step_type == 'transport':
             # Create a dictionary of all read instruments
-            read_dict = {key: self.__reads.get(key) for key in self.__reads}
-            read_list = list(read_dict.keys()) + self.vna_data_info(vna)
-        # 2D vna sweep ------------------------------------------------------------------ #
-        elif sweep_type == 'vna' and step_type == 'vna':
-            # Create a dictionary of only the read instruments that include 'vna'
-            read_keys = [key for key in self.__reads if 'vna' in key]
-            read_dict = {key: self.__reads.get(key) for key in read_keys}
-            read_list = self.vna_data_info()
+            transport_dict = {key: self.__reads.get(key) for key in self.__reads if 'vna' not in key}
+            vna_dict = format_router.get_read_dict(vna)
+            read_dict = {**transport_dict, **vna_dict}
+            read_list = list(read_dict.keys())
         # Error condition --------------------------------------------------------------- #
         else:
             print('''
-            Problem: sweep_type and step_type must be \'transport\', \'vna\' or none
+            Problem: sweep_type and step_type must be \'transport\', \'vna\' or none.
+            Also, \'vna\' is not setup as a step option, only a sweep.
             ''')
             return
 
@@ -1089,7 +1194,8 @@ class exp3():
         sweep_list: list = None,        # list of values to sweep over (if applicable)
         sweep_controls: dict = None,    # e.g. {'power': (val0, instr, task)}
         read_dict: dict = None,         # used in pull_vna_data
-        step_val=0):                    # optional step tag for outer sweeps
+        step_val=0,                     # optional step tag for outer sweeps
+        format_router=None):                   
         # The data from the vna sweep will be stored in this list
         sweep_data = []
         # Unpack the number of frequency points 
@@ -1112,13 +1218,9 @@ class exp3():
             vna.set_sweep_points(num_pts)
             # Wait for the VNA to finish the sweep
             self.vna_meas_wait(vna)
-            # Only pull from the vna read_dict entires
-            vna_only_dict = {k: v for k, v in read_dict.items() if k.startswith('vna_')}
             # Pull the VNA data from the read_dict
-            vna_arr = self.pull_vna_data(vna_only_dict)
-            # Switch to a numpy array for later slicing
-            vna_arr = np.array(vna_arr)
-            vna_arr = vna_arr.T # Transpose to match frequency points
+            vna_arr_raw = self.pull_vna_data(read_dict)
+            vna_arr = format_router.reshape_data(vna_arr_raw, vna)
             # Create a frequency index based on the number of sweep points
             freq_index = np.linspace(start_freq, stop_freq, num_pts, endpoint=True)
             # If step_val is a list or tuple, create a step index for each value
@@ -1140,8 +1242,9 @@ class exp3():
             apply_control(instr, task, val)
 
             self.vna_meas_wait(vna)
-            vna_arr = self.pull_vna_data(read_dict)
-            vna_arr = np.array(vna_arr).T  # Transpose to match frequency points
+            # Pull the VNA data from the read_dict
+            vna_arr_raw = self.pull_vna_data(read_dict)
+            vna_arr = format_router.reshape_data(vna_arr_raw, vna)
             freq_pts = vna.get_fpoints(vna)
             freq_index = freq_pts[:,None] # Ensure freq_index is 2D
             sweep_index = np.full((len(freq_pts), 1), val) 
@@ -1213,11 +1316,12 @@ class exp3():
         self,     
         step_map: dict,
         step_controls: dict,
-        sweep_func: callable,   # Function being swept (e.g. self.run_transport_sweep_vlch)
+        sweep_func: callable,   # Function being swept (e.g. self.run_transport)
         sweep_args: list,       # Arguments for the sweep function
         *,
         step_order: list,       # Order-dependent list of step variable name
-        sweep_order: list       # Order-dependent list of sweep variable name
+        sweep_order: list,      # Order-dependent list of sweep variable name
+        format_router=None
         ):     
         # Create an empty list for the sweep data
         sweep_data = []
@@ -1240,9 +1344,18 @@ class exp3():
             # Having set all of the instruments to their values for this step,...
             # Sleep to allow the instruments/setup to settle
             sleep(self.tconst)
-            # Run the function of the 'sweep_func' argument with the sweep_args
-            out_data = sweep_func(*sweep_args, 
-                       step_val=step_vals[0] if len(step_vals) == 1 else step_vals)
+
+            # Use format_router only if sweep_func expects it
+            if format_router and sweep_func.__name__ == 'run_vna_sweep':
+                out_data = sweep_func(
+                    *sweep_args,
+                    step_val=step_vals[0] if len(step_vals) == 1 else step_vals,
+                    format_router=format_router)
+            else:
+                out_data = sweep_func(
+                    *sweep_args,
+                    step_val=step_vals[0] if len(step_vals) == 1 else step_vals)
+                
             # Extend the sweep_data with the out_data
             sweep_data.extend(out_data)
             # Track step index for each row
@@ -1255,7 +1368,8 @@ class exp3():
     ## Run Experiment ------------------------------------------------------------------ ##
     #######################################################################################
 
-    def run_experiment(self, exp_name = 'sweep_NA', savedata = False, **kwargs):
+    def run_experiment(self, exp_name = 'sweep_NA', savedata = False,
+                       format_tag = 'MLOG', **kwargs):
 
         # Import definitions from the 'init_reads'
         (
@@ -1269,7 +1383,7 @@ class exp3():
         step_lists, 
         num_sweep_points, 
         num_step_points
-        ) = self.init_reads()
+        ) = self.init_reads(printing=False, format_router=format_tag)
 
         # Begin with the sweep_data set as None
         sweep_data = None
@@ -1288,6 +1402,12 @@ class exp3():
         # Assign the step lists to their variables and then package as a dictionary
         step_map = dict(zip(self.__step['variable'], self.__step['step lists']))
 
+        # If the sweep type is 'vna', create a VNAFormatRouter to handle the format
+        if sweep_type == 'vna':
+            router = VNAFormatRouter(format_tag)
+            router.apply_format(vna)
+            read_dict = router.get_read_dict(vna)
+
 
         ###################################################################################
         ## 1D Sweep Options ------------------------------------------------------------ ##
@@ -1303,7 +1423,8 @@ class exp3():
                     sweep_var=sweep_order[0],
                     sweep_list=sweep_map.get(sweep_order[0]),
                     sweep_controls=sweep_controls,
-                    read_dict=read_dict)
+                    read_dict=read_dict,
+                    format_router=router)
                             
             # 1D Transport Sweep -------------------------------------------------------- #
             elif sweep_type == 'transport':
@@ -1371,7 +1492,8 @@ class exp3():
                     sweep_args=[vna, num_sweep_points, sweep_var,
                         sweep_list, sweep_controls, read_dict],
                     step_order=step_order,
-                    sweep_order=sweep_order)
+                    sweep_order=sweep_order,
+                    format_router=router)
             
             # 2D Transport-Transport Sweep ---------------------------------------------- #
             elif sweep_type == 'transport':  
@@ -1403,9 +1525,16 @@ class exp3():
 
         # Create Column Headers
         if sweep_type == 'vna':
-            read_cols = [k for k in read_dict if k.startswith('vna_')]
+            router_meta = router.get_metadata_dict()
+            read_cols = router_meta['columns']    
+            col_units = router_meta['units'] 
+            columns_with_units = [
+                f"{col} [{unit}]" if unit else col
+                for col, unit in zip(read_cols, col_units)
+            ]
         elif sweep_type == 'transport':
             read_cols = list(select_read.keys())
+            columns_with_units = read_cols
         else:
             print('Problem: sweep_type must be \'transport\' or \'vna\'')
             return
@@ -1418,7 +1547,7 @@ class exp3():
             step_order = ['empty step']
 
         # Construct the full column list
-        columns = step_order + sweep_order + read_cols
+        columns = step_order + sweep_order + columns_with_units
 
         # Check that the sweep_data is a list of lists and that each row has the same
         # length as columns.

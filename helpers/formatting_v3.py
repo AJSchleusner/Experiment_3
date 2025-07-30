@@ -37,7 +37,9 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.table import Table
 import matplotlib.patches as patches
 from matplotlib.ticker import MaxNLocator
+import matplotlib.cm as cm
 from matplotlib.cm import ScalarMappable
+import matplotlib.colors as mcolors
 from functools import partial
 from scipy.optimize import curve_fit
 from pathlib import Path
@@ -108,13 +110,19 @@ def load_experiment_data(db_path: str):
             # Flatten each (start, stop) pair into two lines in order
             formatted = []
             for pair in parsed_vals:
-                formatted.extend([f"{round(val / 1e9, 3)} GHz" for val in pair])
+                formatted.extend([f"{scale_to_ghz(val)} GHz" for val in pair])
             metadata[col] = formatted
         # If the column is 'set_vna_meas', extract S-parameters
         elif col == "set_vna_meas":
             match = re.search(r"\bS\d{2}\b", str(raw_vals))
             if match:
                 metadata.setdefault(col, []).append(match.group())
+        # Remove the suffix from the sweep_pts column and just report the value
+        elif "sweep_pts" in col.lower():
+            # Extract just the numeric portion from each entry
+            values = [re.search(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", str(v)) for v in raw_vals]
+            cleaned = [match.group() if match else "N/A" for match in values]
+            metadata[col] = cleaned
         else:
             # Default: treat values as strings
             values = [str(v) for v in raw_vals]
@@ -170,7 +178,7 @@ def get_vna_format(metadata):
 ###########################################################################################
 
 # Format plots for displaying data and the meta data.
-def format_plot(fig_wide = 12, fig_tall = 8, left_width = 2.5, right_width = 1):
+def format_plot(fig_wide = 12, fig_tall = 9, left_width = 2.5, right_width = 1):
     fig = plt.figure(figsize= (fig_wide, fig_tall))
     # Create a GridSpec layout with 1 row and 2 columns
     gs = GridSpec(1, 2, width_ratios=[left_width, right_width], figure=fig)
@@ -182,18 +190,20 @@ def format_plot(fig_wide = 12, fig_tall = 8, left_width = 2.5, right_width = 1):
     return fig, ax_plot, ax_meta
 
 # Comment wrapping definition
-def wrap_comment(text, max_chars=60):
-    return "\n".join(textwrap.wrap(text, width=max_chars))
+def wrap_comment(text, max_chars=30):
+    lines = text.split('\n')
+    wrapped = [textwrap.fill(line, max_chars) for line in lines]
+    return "\n".join(wrapped)
 
-
-
-
-
-
+# Get a list of colors indexed by the number of lines in the plot
+def get_indexed_colors(num_lines, cmap_name='viridis'):
+    cmap = cm.get_cmap(cmap_name, num_lines)
+    norm = mcolors.Normalize(vmin=0, vmax=num_lines - 1)
+    return [cmap(norm(i)) for i in range(num_lines)]
 
 
 # Format plots for displaying data and n metadata tables.
-def form_plot(num_meta: int=1, fig_w = 13, fig_h = 8, left_width = 2.5,
+def form_plot(num_meta: int=1, fig_w = 13, fig_h = 9, left_width = 2.5,
               right_width = 1, facecolors=None, titles=None):
     fig = plt.figure(figsize= (fig_w + 2*num_meta - 2, fig_h))
     # Total columns is 1 for data and num_meta for metadata
@@ -232,72 +242,110 @@ def meta_table(ax, metadata: dict, title: str = 'Metadata', fontsize=12,
     ax.clear()
     # Dynamically change box_height based on whether comments are present
     has_comments = comm_on and bool(comments)
-    box_height = 0.96 if not has_comments else 0.96 + 0.12  
-    # Set the table's title
-    ax.set_title(title, fontsize=fontsize+4, loc='center', pad=10)
-    ax.axis('off')  # Turn off the axis
-    # Compute layout
-    key_width = 0.50  # percentage of horizontal space for keys
-    value_start = 0.03 + key_width + 0.04  # left padding + key width + spacing
-    y_pos = 0.98  # Start near top of box
-    line_spacing = 0.98/(len(metadata)+1)  # normalized spacing per line
 
-    # Populate the table with the metadata entires
+    # Estimate comment line count
+    comment_lines = wrap_comment("\n".join(comments), max_chars=30).count('\n') + 1 if has_comments else 0
+
+    # Estimate total content height including comments
+    line_count = sum(len(v) if isinstance(v, list) else 1 for v in metadata.values())
+    total_lines = line_count + comment_lines + 1  # +1 for padding/title
+
+    line_spacing = 0.03
+    box_height = line_spacing * total_lines
+    max_box_height = 0.96 
+
+    # Clamp to avoid overflow
+    box_height = min(box_height, max_box_height)
+    patch_y = 0.5 - box_height / 2  # Center the box vertically
+
+
+    # 1. Calculate layout
+    line_spacing = box_height / (len(metadata) + comment_lines)
+    y_pos_start = 0.5 + box_height / 2 - line_spacing  # Top of the box
+
+    # 2. Add the patch centered around content
+    rect = patches.FancyBboxPatch(
+        (0, patch_y), 1.1, box_height,
+        boxstyle="round,pad=0.02",
+        linewidth=style['tick_width'] if style else 3,
+        edgecolor="black",
+        facecolor=facecolor,
+        transform=ax.transAxes,
+        clip_on=False)
+    # Add the rectangle to the table
+    ax.add_patch(rect)
+
+    # 3. Title and metadata
+    # Position title just above the top edge of the patch
+    title_y = patch_y + box_height + 0.03  # small margin above patch
+    ax.text(0.5, title_y, title,
+            fontsize=fontsize + 4,
+            ha='center',
+            va='bottom',
+            transform=ax.transAxes)
+    ax.axis('off')
+
+    # 4. Render content at correct y_pos
+    key_width = 0.55  # percentage of horizontal space for keys
+    value_start = 0.03 + key_width + 0.04  # left padding + key width + spacing
+    y_pos = y_pos_start + 0.04
     for k, v in metadata.items():
         val_lines = v if isinstance(v, list) else [str(v)]
         num_lines = len(val_lines)
-        # Key only on first line
         ax.text(0.02, y_pos, k, fontsize=fontsize, fontfamily='monospace',
                 ha='left', va='top', transform=ax.transAxes)
-        # Each value line on its own row
         for i, line in enumerate(val_lines):
             ax.text(value_start, y_pos - i * line_spacing, line, fontsize=fontsize,
                     fontfamily='monospace', ha='left', va='top', transform=ax.transAxes,
                     clip_on=True)
-        # Adjust y position for next key-value pair
         y_pos -= line_spacing * num_lines
-        # Border box
-        rect = patches.FancyBboxPatch(
-            (0, 0.98-box_height), 1, box_height,
-            boxstyle="round,pad=0.02",
-            linewidth=style['tick_width'] if style else 3,
-            edgecolor="black",
-            facecolor=facecolor,
-            transform=ax.transAxes,
-            clip_on=False)
-        # Add the rectangle to the table
-        ax.add_patch(rect)
 
-    # If comments are present, add a divider line
-    if has_comments:
-        divider_y = 0
-        ax.plot([0.08, 0.92], [divider_y, divider_y],
-                transform=ax.transAxes,
-                color="black",
-                linewidth=style['tick_width'] if style else 2,
-                solid_capstyle='round')
-
-    # Render comment separately at the bottom
-    if comments and comm_on == True:
-        # Merge and wrap all comments into a single string
+    # 5. Render comments below (if enabled)
+    if comments and comm_on:
         comment_text = wrap_comment("\n".join(comments), max_chars=30)
         ax.text(
-            0.02,  -0.06,  # Just below the box
+            0.02, patch_y - 0.00,
             comment_text,
-            fontsize=fontsize - 1,
+            fontsize=fontsize - 2,
             fontstyle='italic',
             fontfamily="monospace",
             ha='left',
             transform=ax.transAxes,
             clip_on=False,
-            linespacing=1.3)
+            linespacing=1.3,
+            wrap=True)
 
+def scale_to_ghz(val):
+    if val > 1e6:  # Assume Hz
+        return round(val / 1e9, 3)
+    return round(val, 3)  # Already in GHz
 
 ###########################################################################################
 ## Formatting the Plot ----------------------------------------------------------------- ##
 ###########################################################################################
 
 # General Format ------------------------------------------------------------------------ #
+
+def reshape_to_2dz(x, y, z):
+    # Find the unique x and y values
+    unique_x = np.unique(x)
+    unique_y = np.sort(np.unique(y))
+    # Create a 2D grid for the z values
+    out_z = z.reshape(len(unique_y), len(unique_x))
+    # If the first y is less than the last, flip the data vertically
+    if unique_y[0] < unique_y[-1]:
+        out_z = out_z[::-1, :] # Flip vertically
+    out_x = unique_x
+    out_y = unique_y
+    return out_x, out_y, out_z
+
+def to_magnitude(real, imag):
+    return np.sqrt(real**2 + imag**2)
+
+def to_phase(real, imag, deg=True):
+    phase_rad = np.arctan2(imag, real)
+    return np.degrees(phase_rad) if deg else phase_rad
+
 
 def general_plt(ax, xlabel=None, ylabel=None, title=None, log_y=None, ylims=None,
                 style=None, legend=True):
@@ -373,9 +421,8 @@ def form_1d_plot(ax, sweep, data, meta, filename=None, sweep_type=None, style=No
 
 
 # 2D Plot ------------------------------------------------------------------------------- #
-def form_2d_plot(ax, data, meta, filename=None, 
-                sweep_type=None, 
-                vmin=None, vmax=None, style=None):
+def form_2d_plot(ax, data, meta, filename=None, sweep_type=None, 
+                vmin=None, vmax=None, style=None, sdata_phase=False):
 
     # Clear the axis before plotting
     ax.clear()
@@ -392,6 +439,10 @@ def form_2d_plot(ax, data, meta, filename=None,
             z_label = "Im(S21) (dB)"
         elif vna_form == 'REAL':
             z_label = "Re(S21) (dB)"
+        elif vna_form == 'SDATA' and sdata_phase:
+            z_label = r"$\phi$ (S21) (degrees)"
+        elif vna_form == 'SDATA' and not sdata_phase:
+            z_label = "S21 (dB)"
         else:
             print(f"Unknown VNA format: {vna_form}. Update code to include format.")
             return
@@ -399,21 +450,25 @@ def form_2d_plot(ax, data, meta, filename=None,
     # Customize plot based on sweep_type
     if sweep_type == 'power':
         # Select the columns in the data table 
-        frequencies  = data[:,5]
-        powers       = data[:,3]
-        measurements = data[:,4]
-        # Find the unique frequencies and powers
-        unique_freqs = np.unique(frequencies)
-        unique_powers = np.sort(np.unique(powers))
-        # Sort the unique powers to ensure the y-axis is in ascending order
-        sort_indices = np.argsort(unique_powers)
-        # Create a 2D grid for the measurements
-        data_z = measurements.reshape(len(unique_powers), len(unique_freqs))
-        # If the first power is less than the last, flip the data vertically
-        if unique_powers[0] < unique_powers[-1]:
-            data_z = data_z[::-1, :] # Flip vertically
-        data_x = unique_freqs * 1e-9  # Convert Hz to GHz
-        data_y = unique_powers  # Power in dBm
+        if vna_form == 'SDATA':
+            powers      = data[:,3] 
+            real_col    = data[:,4]
+            imag_col    = data[:,5]
+            frequencies = data[:,6]
+            # Convert the real and imaginary parts to magnitude if sdata_phase is False
+            if not sdata_phase:
+                measurements = 20*np.log10(np.sqrt(real_col**2 + imag_col**2))
+            # Convert to phase if sdata_phase is True
+            if sdata_phase:
+                measurements = np.angle(real_col + 1j*imag_col, deg=True)
+        else:
+            powers       = data[:,3]
+            measurements = data[:,4]
+            frequencies  = data[:,5]
+
+        # Preprocess axis data
+        data_x, data_y, data_z = reshape_to_2dz(frequencies, powers, measurements)
+        data_x *= 1e-9  # Convert Hz to GHz
 
         # Plot the 2D power sweep
         if vmin is None or vmax is None:
@@ -557,12 +612,69 @@ def plot_exp_sets(ax, plot_data, xlabel=None, ylabel=None, filename=None,
             return
     # Set the general plot settings
     general_plt(ax, xlabel=xlabel, ylabel=ylabel,
-                title=filename, log_y=False, ylims=None,
+                title=filename, log_y=log_y, ylims=ylims,
                 style=style, legend=True)
     return
 
 
+# Waterfall Plot ------------------------------------------------------------------------ #
 
+def plot_waterfall(ax, x, y, z, y_indices=None, offset_step=5, 
+                   style=None, do_fits=False, user_guess=None,
+                   artifact_indices=None, cmap_name='viridis'):
+    """
+    Plots selected linecuts of a 2D dataset in a waterfall format.
+    
+    Parameters:
+    ax          : matplotlib axis
+    x, y, z     : 2D plot data (e.g., from form_2d_plot)
+    y_indices   : list of y-axis indices to plot linecuts from
+    offset_step : vertical offset between traces
+    style       : dict for styling parameters (optional)
+    """
+    # Default: evenly spaced linecuts across y
+    if y_indices is None:
+        y_indices = np.linspace(0, len(y)-1, 10, dtype=int)
+    # Get indexed colors
+    colors = get_indexed_colors(len(y_indices), cmap_name)
+    # Create an empty quality factor list
+    q_factors = []
+    # Loop through the selected y indices
+    for idx, i in enumerate(y_indices):
+        trace = z[i, :]
+        # Plotting parameters 
+        label = f"{y[i]:.1f} dBm"
+        offset = idx * offset_step
+        color = colors[idx] if colors else style.get('color', None)
+        # Optionally find the lorz_inv fits and quality factor
+        if do_fits:
+            try:
+                popt, _, model = fit_data(x, trace, 'lorz_inv', artifact_indices, 
+                                          user_guess=user_guess)
+                q_factors.append(popt[1] / popt[2])
+            except Exception:
+                q_factors.append(np.nan)
+            # Add quality factor to the label if fitting was done
+            label = f"{y[i]:.1f} dBm, Q={q_factors[-1]:.2f}"
+        # Make the waterfall plot
+        ax.plot(x, trace + offset, label=label,
+                linewidth=style.get('line_width', 1.5),
+                color=color)
+        # If fitting was done, plot the fit curve
+        if do_fits:
+            fit_curve = model(x, *popt)
+            # Plot the fit curve with a dashed line
+            ax.plot(x, fit_curve + offset, 
+                    '--', color='black', linewidth=2)
+    # Apply the general_plt function to format the plot
+    general_plt(ax,
+                xlabel="Frequency (GHz)",
+                ylabel="S21 (dBm)",
+                title="Waterfall Plot",
+                style=style,
+                legend=True)
+    # Return the quality factors if fits were done
+    return np.array(q_factors) if do_fits else None
 
 
 
@@ -583,8 +695,11 @@ def plot_exp_sets(ax, plot_data, xlabel=None, ylabel=None, filename=None,
 def linear(x, slope, intercept):
     return slope * x + intercept
 
-def lorentzian(x, amp,center, width, offset):
+def lorentzian(x, amp, center, width, offset):
     return amp*(0.5*width)**2 / ((x - center)**2 + (0.5*width)**2) + offset
+
+def lorz_inv(x, amp, center, width, offset):
+    return -amp*(0.5*width)**2 / ((x - center)**2 + (0.5*width)**2) + offset
 
 def gaussian(x, amp, center, sigma, offset):
     return amp * np.exp(-((x - center) ** 2) / (2 * sigma ** 2)) + offset
@@ -592,30 +707,95 @@ def gaussian(x, amp, center, sigma, offset):
 # Get the appropriate fitting model and initial guess based on the fit_type
 def get_fit_model(fit_type):
     models = {
-        'linear':{
+        'linear': {
             'func': linear,
-            'guess': lambda x, y: [np.polyfit(x, y, 1)[0], np.polyfit(x, y, 1)[1]]
+            'guess': lambda x, y: [np.polyfit(x, y, 1)[0], np.polyfit(x, y, 1)[1]],
+            'params': ['slope', 'intercept']
         },
         'lorentzian': {
             'func': lorentzian,
-            'guess': lambda x, y: [max(y) - min(y), x[np.argmax(y)], (max(x) - min(x)) / 10, min(y)]
+            'guess': lambda x, y: [max(y) - min(y), x[np.argmax(y)], (max(x) - min(x)) / 10, min(y)],
+            'params': ['amplitude', 'center', 'width', 'offset']
+        },
+        'lorz_inv': {
+            'func': lorz_inv,
+            'guess': lambda x, y: [max(y) - min(y), x[np.argmin(y)], (max(x) - min(x)) / 10, min(y)],
+            'params': ['amplitude', 'center', 'width', 'offset']
         },
         'gaussian': {
             'func': gaussian,
-            'guess': lambda x, y: [max(y) - min(y), x[np.argmax(y)], (max(x) - min(x)) / 10, min(y)]
+            'guess': lambda x, y: [max(y) - min(y), x[np.argmax(y)], (max(x) - min(x)) / 10, min(y)],
+            'params': ['amplitude', 'center', 'width', 'offset']
         }
     }
     if fit_type not in models:
         raise ValueError(f"Unsupported fit_type: {fit_type}")
-    return models[fit_type]['func'], models[fit_type]['guess']
+    return models[fit_type]['func'], models[fit_type]['guess'], models[fit_type]['params']
+
+# Help text for each model
+model_help = {
+    'linear': 'linear(x, m, b): m = slope, b = intercept',
+    'lorentzian': 'lorentzian(x, A, x0, w, y0): A = amplitude, x0 = center, w = width, y0 = offset',
+    'lorz_inv': 'lorz_inv(x, A, x0, w, y0): inverse form of Lorentzian',
+    'gaussian': 'gaussian(x, A, x0, w, y0): standard Gaussian model'
+}
+def print_model_help():
+    print("📘 Fit Models Reference:")
+    for name, desc in model_help.items():
+        print(f"- {name}: {desc}")
 
 # Fit data using curve_fit from scipy.optimize
-def fit_data(x, y, fit_type):
-    model_func, guess_func = get_fit_model(fit_type)
-    p0 = guess_func(x, y)
-    popt, pcov = curve_fit(model_func, x, y, p0=p0)
+def fit_data(x, y, fit_type, artifact_indices=None, user_guess=None):
+    if artifact_indices:
+        x_new, y_new = exclude_artifacts(x, y, artifact_indices)
+    else:
+        x_new, y_new = x, y
+    # Extract the model function, guess function, and parameter names
+    model_func, guess_func, param_names = get_fit_model(fit_type)
+    expected_len = len(param_names)
+    # If a user guess is provided, check its length
+    if user_guess is not None:
+        if len(user_guess) != expected_len:
+            raise ValueError(f"Incorrect guess length for '{fit_type}'. Expected {expected_len} parameters: {param_names}")
+        p0 = user_guess
+    else:
+        p0 = guess_func(x_new, y_new)
+    # Perform the curve fitting
+    popt, pcov = curve_fit(model_func, x_new, y_new, p0=p0)
     return popt, pcov, model_func
 
+# Find quality factors using the inverse lorentzian
+def quality_fits(freq, power, data, artifact_indices=None, user_guess=None):
+    # Initialize for quality factor sweep
+    fit_type = 'lorz_inv'
+    q_values = []
+    # Reshape to make data 2D
+    data_x, data_y, data_z = reshape_to_2dz(freq, power, data)
+    # Convert frequencies to GHz
+    data_x = data_x * 1e-9
+    # Run the fitting loop
+    for i in range(data_z.shape[0]):
+        # Take the i-th row of the data_z matrix
+        trace = data_z[i, :]
+        try:
+            popt, _, _ = fit_data(data_x, trace, fit_type, artifact_indices,
+                                   user_guess=user_guess)
+            # Calculate the quality factor
+            q = popt[1] / popt[2]
+        except Exception:
+            q = np.nan  # If fitting fails, set q to NaN
+        # Replace if q is NaN or non-positive
+        if np.isnan(q) or q <= 0:
+            q = 1e-10
+        # Append the quality factor to the list
+        q_values.append(q)
+    return np.array(data_y), np.array(q_values)
+
+# Exclude artifacts for curve fitting
+def exclude_artifacts(x, z, artifact_indices):
+    mask = np.ones(len(x), dtype=bool)
+    mask[artifact_indices] = False
+    return x[mask], z[mask]
 
 
 ###########################################################################################
@@ -662,321 +842,158 @@ def create_save_path(db_path: str, fig_type:str = 'png') -> str:
 
 
 
+###########################################################################################
+## Circle Fitting and Plotting --------------------------------------------------------- ##
+###########################################################################################
+
+# Reshape circle fit data into a dictionary format for easier access
+def reshape_circle_data(freqs, real, imag, power):
+    freqs = np.array(freqs)
+    real  = np.array(real)
+    imag  = np.array(imag)
+    power = np.array(power)
+    # Identify unique step values
+    unique_steps = np.unique(power)
+    # Group indices by step value (as opposed to step index)
+    grouped_data = {}
+    for p in unique_steps:
+        mask = (power == p)
+        grouped_data[p] = {
+            'freq': freqs[mask],
+            'S21': real[mask] + 1j * imag[mask]
+        }
+    return grouped_data  # Dictionary keyed by step value (usually power in dBm)
 
 
 
-class plot_main():
-    def __init__(self, filename):
-        self.filename = filename
-        self.sweep, self.step, self.data, self.metadata = get_data_from_sqlitedb(filename)
-        
-        dimension = self.oneD_or_twoD()
-        print('File is a ' + dimension + ' measurement')
-        if dimension == '1D':
-            print('arrange_data_for_plotting() returns: sweep, signal, x_label, y_label')
-        elif dimension == '2D':
-            print('arrange_data_for_plotting() returns: sweep, step, signal, x_label, y_label, z_label')
-    
-    def return_metadata(self):
-        return self.metadata
 
-    def table_names(self):
-        tablenames = get_table_names(self.filename, tab = False)
-        return tablenames
-    
-    def column_names(self, tablename):
-        col_names = get_column_names_from_table(self.filename, tablename, tab = False)
-        return col_names
-    
-    def get_sweep_type(self):
-        swp = self.column_names('table_sweep')
-        if swp[0] == 'freq_range':
-            return 'VNA frequency (Hz)'
-        else:
-            return swp[0]
-                                                
-    def get_data_names(self):
-        name = self.column_names('table_data')
-        if 'Vx' in name[2]:
-            return 'Lock-in signal'
-        elif 'vna' in name[2]:
-            return 'VNA signal'
-        else:
-            return name[2]
-    
-    def get_vna_type(self):
-        cols = self.column_names('table_data')
-        if len(cols) == 4:
-            if 'VNA2' in cols[3] or 'vna_y2' in cols[3]:
-                return 'SMITH'
-            else:
-                print('i dont know!!!!!')
-                return 'VNA'
-        else:
-            return 'VNA'
-        
-    def get_step_type(self):
-        stp = self.column_names('table_step')
-        if stp == 'None':
-            return None
-        else:
-            return stp[0]
-    
-    def oneD_or_twoD(self):
-        stp = self.get_step_type()
-        if stp == 'None':
-            return '1D'
-        else:
-            return '2D'
-        
-    def if_transport_VNA(self, swp = None):
-        if swp == None:
-            swp = self.column_names('table_sweep')
-            if 'freq_range' in swp:
-                return 'VNA'
-            else:
-                return 'Transport'
-        else:
-            return swp
-        
-    def old_data(self, meta = True):
-        if meta:
-            return self.sweep, self.step, self.data, self.metadata
-        else:
-            return self.sweep, self.step, self.data
-        
-    def arrange_data_for_plotting(self, avg_len = 5, in1 = 0, in2 = 0, sig_index = 2, stype = None, **kwargs):
-        swtype = self.if_transport_VNA(swp = stype)
-        if swtype == 'Transport':
-            if self.oneD_or_twoD() == '1D':
-                print('1D transport... returning sweep, signal, x_label, y_label')
-                sweep = self.sweep[:,0]
-                offset_x = np.average(self.data[0:avg_len, 2])
-                offset_y = np.average(self.data[0:avg_len, 3])
-                signal = (np.sqrt((self.data[:, 2] - offset_x)**2 + (self.data[:, 3] - offset_y)**2))*1e3
-                y_label = self.get_data_names()
-                x_label = self.get_sweep_type()
-                return sweep, signal, x_label, y_label
+def format_circle_data(freqs, real, imag, power,
+                       remove_phase_slope=False,
+                       reconstruct_complex=False, n=8):
+    freqs = np.array(freqs)
+    real  = np.array(real)
+    imag  = np.array(imag)
+    power = np.array(power)
 
-            elif self.oneD_or_twoD() == '2D':
-                print('2D transport... returning sweep, step, signal, x_label, y_label, z_label')
-                sweep = self.sweep[:,0]
-                step = self.step[:,0]
-                num_y = len(self.step[:,0])
-                num_x = len(self.sweep[:,0])
-                signal = np.zeros((num_y, num_x))
-                for i in range(num_y):
-                    data_x = self.data[i*num_x:((i+1)*num_x), 2]
-                    data_y = self.data[i*num_x:((i+1)*num_x), 3]
-                    offset_x = np.average(self.data[i*num_x + 0:i*num_x + 8, 2])
-                    offset_y = np.average(self.data[i*num_x + 0:i*num_x + 8, 3])
-                    signal[i, :] = np.sqrt((data_x - offset_x)**2 + (data_y - offset_y)**2)*1e3  # in mV
-                y_label = self.get_step_type()
-                x_label = self.get_sweep_type()
-                z_label = self.get_data_names()
-                return sweep, step, signal, x_label, y_label, z_label
+    # Allocate arrays
+    powers_1d = np.sort(np.unique(power))
+    freqs_1d  = np.sort(np.unique(freqs))
+    mag       = {}
+    phase     = {}
 
-        elif swtype == "VNA":
-            vnatype = self.get_vna_type()
-            if vnatype == 'VNA':
-                if self.oneD_or_twoD() == '1D':
-                    print('1D VNA... returning sweep, signal, x_label, y_label')
-                    sweep = self.sweep[:,0]
-                    signal = self.data[:, sig_index]
-                    y_label = self.get_data_names()
-                    x_label = self.get_sweep_type()
-                    return sweep, signal, x_label, y_label
+    for i, p in enumerate(powers_1d):
+        mask = (power == p)
+        s21  = real[mask] + 1j * imag[mask]
+        mag  [p] = np.abs(s21)
+        phase[p] = np.unwrap(np.angle(s21))
 
-                elif self.oneD_or_twoD() == '2D':
-                    print('2D VNA... returning sweep, step, signal, x_label, y_label, z_label')
-                    sweep = self.sweep[:,0]
-                    step = self.step[in1:, in2]
-                    num_y = len(step)
-                    num_x = len(sweep)
-                    signal = np.zeros((num_y, num_x))
-                    for i in range(num_y):
-                        data_x = self.data[i*num_x:((i+1)*num_x), sig_index]
-                        signal[i, :] = data_x
-                    y_label = self.get_step_type()
-                    x_label = self.get_sweep_type()
-                    z_label = self.get_data_names()
-                    return sweep, step, signal, x_label, y_label, z_label
-            else:
-                if self.oneD_or_twoD() == '1D':
-                    print('VNA data is in 1D with two y-vals format... returning sweep, signal1, signal2, xlabel, y_label1, ylabel2')
-                    sweep = self.sweep[:,0]
-                    signal1 = self.data[:, sig_index]
-                    signal2 = self.data[:, sig_index + 1]
-                    y_label1 = 'vna_y1'
-                    y_label2 = 'vna_y2'
-                    x_label = self.get_sweep_type()
-                    return sweep, signal1, signal2, x_label, y_label1, y_label2
-                
-                elif self.oneD_or_twoD() == '2D':
-                    print('2D VNA... returning sweep, step, signal1, signal2, x_label, y_label, z_label')
-                    sweep = self.sweep[:,0]
-                    step = self.step[in1:, in2]
-                    num_y = len(step)
-                    num_x = len(sweep)
-                    signal1 = np.zeros((num_y, num_x))
-                    signal2 = np.zeros((num_y, num_x))
-                    for i in range(num_y):
-                        data_x1 = self.data[i*num_x:((i+1)*num_x), sig_index]
-                        data_x2 = self.data[i*num_x:((i+1)*num_x), sig_index + 1]
-                        signal1[i, :] = data_x1
-                        signal2[i, :] = data_x2
-                    y_label = self.get_step_type()
-                    x_label = self.get_sweep_type()
-                    z_label = self.get_data_names()
-                    return sweep, step, signal1, signal2, x_label, y_label, z_label
+    # Optionally remove linear slope in phase (vs frequency) for each power slice
+    if remove_phase_slope:
+        phase_prime = {}
+        for p in powers_1d:
+            ph = phase[p]
 
-class live_plot():
-    def __init__(self, sweep_in:str, read_in:str, sweep_dat, data_dat, step_in = None, step_dat = None):
-        self.sweep_in = sweep_in # input will be sweep_instr from experiment
-        self.step_in = step_in # input will be step_instr from experiment
-        self.read_in = read_in # input will be read_keys from experiment
+            # First and last n-point averages
+            x_start = np.mean(freqs_1d[:n])
+            x_end   = np.mean(freqs_1d[-n:])
+            y_start = np.mean(ph[:n])
+            y_end   = np.mean(ph[-n:])
 
-        self.sweep_dat = sweep_dat # input will be in sweep table from experiment
-        self.step_dat = step_dat # input will be in step table from experiment
-        self.data_dat = data_dat # input will be in data table from experiment
+            # Compute slope from line connecting these averages
+            slope = (y_end - y_start) / (x_end - x_start)
 
-        if self.step_in != None:
-            self.plot_2D()
-
-        else:
-            self.plot_1D()
-
-    def oneD_or_twoD(self):
-        stp = self.step_dat
-        if stp is None:
-            return '1D'
-        else:
-            return '2D'
+            # Construct linear trend and subtract
+            linear_trend = slope * (freqs_1d - x_start) + y_start
+            phase_prime[p] = ph - linear_trend
 
 
-    def arrange_data_for_plotting(self, avg_len = 1):
-        swtype = self.sweep_in
-        if swtype == 'transport':
-            if self.oneD_or_twoD() == '1D':
-                sweep = self.sweep_dat[:,0]
-                offset_x = np.average(self.data_dat[0:avg_len, 2])
-                offset_y = np.average(self.data_dat[0:avg_len, 3])
-                signal = (np.sqrt((self.data_dat[:, 2] - offset_x)**2 + (self.data_dat[:, 3] - offset_y)**2))*1e3
-                y_label = self.read_in
-                x_label = self.sweep_in
-                return sweep, signal, x_label, y_label
+    # Optionally reconstruct complex data from mag and phase_prime
+    if reconstruct_complex:
+        real_prime = {}
+        imag_prime = {}
+        for p in powers_1d:
+            real_prime[p] = mag[p] * np.cos(phase_prime[p])
+            imag_prime[p] = mag[p] * np.sin(phase_prime[p])
+    else:
+        real_prime, imag_prime = None, None
 
-            elif self.oneD_or_twoD() == '2D':
-                print('2D transport... returning sweep, step, signal, x_label, y_label, z_label')
-                sweep = self.sweep_dat[:,0]
-                try:
-                    step = self.step_dat[:,0]
-                except:
-                    step = self.step_dat
-                num_y = len(step)
-                num_x = len(sweep)
-                signal = np.zeros((num_y, num_x))
-                for i in range(num_y):
-                    data_x = self.data_dat[i*num_x:((i+1)*num_x), 2]
-                    data_y = self.data_dat[i*num_x:((i+1)*num_x), 3]
-                    offset_x = np.average(self.data_dat[i*num_x + 0:i*num_x + 8, 2])
-                    offset_y = np.average(self.data_dat[i*num_x + 0:i*num_x + 8, 3])
-                    signal[i, :] = np.sqrt((data_x - offset_x)**2 + (data_y - offset_y)**2)*1e3  # in mV
-                y_label = self.step_in
-                x_label = self.sweep_in
-                z_label = self.read_in
-                return sweep, step, signal, x_label, y_label, z_label
-
-        elif swtype == "CPWR":
-            if self.oneD_or_twoD() == '1D':
-                if len(self.data_dat) == 4:
-                    print('VNA data is in 1D with two y-vals format... returning sweep, signal1, signal2, xlabel, y_label1, ylabel2')
-                    sweep = self.sweep_dat[:,0]
-                    signal1 = self.data_dat[:, 2]
-                    signal2 = self.data_dat[:, 2 + 1]
-                    real = signal1
-                    im = signal2
-                    signal = np.sqrt(real**2 + im**2)
-                    y_label = 'vna_sig'
-                    x_label = self.get_sweep_type()
-                    return sweep, signal, x_label, y_label
-
-                else:
-                    print('1D VNA... returning sweep, signal, x_label, y_label')
-                    sweep = self.sweep_dat[:,0]
-                    signal = self.data_dat[:, 2]
-                    y_label = self.read_in
-                    x_label = self.sweep_in
-                    return sweep, signal, x_label, y_label
-
-            elif self.oneD_or_twoD() == '2D':
-                if len(self.data_dat) == 4:
-                    #print('2D VNA... returning sweep, step, signal, x_label, y_label, z_label')
-                    sweep = self.sweep_dat[:,0]
-                    try:
-                        step = self.step_dat[:,0]
-                    except:
-                        step = self.step_dat
-                    num_y = len(step)
-                    num_x = len(sweep)
-                    signal = np.zeros((num_y, num_x))
-                    for i in range(num_y):
-                        real = self.data_dat[i*num_x:((i+1)*num_x), 2]
-                        im = self.data_dat[i*num_x:((i+1)*num_x), 2 + 1]
-                        signal[i, :] = np.sqrt(real**2 + im**2)
-                    y_label = self.get_step_type()
-                    x_label = self.get_sweep_type()
-                    z_label = self.get_data_names()
-                    return sweep, step, signal, x_label, y_label, z_label
+    return {
+        'freq': freqs_1d,
+        'power': powers_1d,
+        'mag': mag,
+        'phase': phase,
+        'phase_prime': phase_prime,
+        'real_prime': real_prime,
+        'imag_prime': imag_prime}
 
 
-                else:
-                    #print('2D VNA... returning sweep, step, signal, x_label, y_label, z_label')
-                    sweep = self.sweep_dat[:,0]
-                    try:
-                        step = self.step_dat[:,0]
-                    except:
-                        step = self.step_dat
-                    num_y = len(step)
-                    num_x = len(sweep)
-                    signal = np.zeros((num_y, num_x))
-                    for i in range(num_y):
-                        data_x = self.data_dat[i*num_x:((i+1)*num_x), 2]
-                        signal[i, :] = data_x
-                    y_label = self.step_in
-                    x_label = self.sweep_in
-                    z_label = self.read_in
-                    return sweep, step, signal, x_label, y_label, z_label
-            
+# Three panel plotting to show : circle fit, resonance curve, and metadata
+def triad_plot(freq, S21, settings, fig_dim = (10, 12), filename = None,
+                w_ratio = [2, 1], h_ratio = [1, 1], alpha=1):
+    fig = plt.figure(figsize=fig_dim)
+    gs = GridSpec(2, 2, width_ratios=w_ratio, height_ratios=h_ratio, figure=fig)
 
-    def plot_1D(self):
-        sweep, signal, x_label, y_label = self.arrange_data_for_plotting()
-        plt.plot(sweep, signal, '.-')
-        plt.xlabel(x_label)
-        plt.ylabel(y_label)
-        plt.show()
+    # Axes setup using advanced layout
+    ax_iq = fig.add_subplot(gs[0, 0])
+    ax_res = fig.add_subplot(gs[1, 0])
+    ax_meta = fig.add_subplot(gs[:, 1])
+    ax_meta.axis('off')  # Leave metadata panel blank for external injection
 
-    def plot_2D(self):
-        sweep, step, signal, x_label, y_label, z_label = self.arrange_data_for_plotting()
-        plt.pcolormesh(sweep, step, signal)
-        plt.xlabel(x_label)
-        plt.ylabel(y_label)
-        plt.colorbar(label = z_label)
-        plt.show()
+    # Convert x-axis to GHz and y-axis to dBm
+    freq_GHz = freq / 1e9
+    S21_dBm = 20 * np.log10(np.abs(S21))
+
+    # Tick and spine styling parameters
+    tick_kwargs = dict(
+        width=settings['tick_width'],
+        length=settings['tick_length'],
+        pad=settings['tick_pad'],
+        direction='in',
+        labelsize=settings['fontsize']
+    )
+
+    # ax_iq plot formatting
+    center_re  = np.mean(S21.real)
+    center_im  = np.mean(S21.imag)
+    span_re    = np.max(S21.real) - np.min(S21.real)
+    span_im    = np.max(S21.imag) - np.min(S21.imag)
+    span_max   = max(span_re, span_im)
+    # Add margin (e.g., 10%)
+    padding    = 0.1 * span_max
+    half_width = 0.5 * span_max + padding
+
+    # Raw IQ plot
+    ax_iq.plot(S21.real, S21.imag, '.', color=settings['line_color'], 
+               markersize=settings['marker_size'], alpha=alpha)
+    ax_iq.set_title(filename, fontsize=settings['title_fontsize']-3, pad=settings['title_pad'])
+    ax_iq.set_xlabel("Re(S21) arb. units", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_iq.set_ylabel("Im(S21) arb. units", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_iq.xaxis.set_major_locator(settings['x_locator'])
+    ax_iq.yaxis.set_major_locator(settings['y_locator'])
+    # Add faint x = 0 and y = 0 gridlines to circle plot
+    ax_iq.axhline(0, color='lightgray', linestyle='--', linewidth=2, zorder=0)
+    ax_iq.axvline(0, color='lightgray', linestyle='--', linewidth=2, zorder=0)
+    ax_iq.set_xlim(center_re - half_width, center_re + half_width)
+    ax_iq.set_ylim(center_im - half_width, center_im + half_width)
+    ax_iq.tick_params(**tick_kwargs)
+    ax_iq.set_aspect('equal')
+    ax_iq.plot(center_re, center_im, 'x', color='skyblue', markersize=8, zorder=3)
+    for spine in ax_iq.spines.values():
+        spine.set_linewidth(settings['tick_width'])
+
+    # Resonance plot with GHz and dBm scaling
+    ax_res.plot(freq_GHz, S21_dBm, color=settings['line_color'], linewidth=settings['line_width'])
+    ax_res.set_xlabel("Frequency (GHz)", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_res.set_ylabel("S21 (dBm)", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_res.xaxis.set_major_locator(settings['x_locator'])
+    ax_res.yaxis.set_major_locator(settings['y_locator'])
+    ax_res.tick_params(**tick_kwargs)
+    for spine in ax_res.spines.values():
+        spine.set_linewidth(settings['tick_width'])
+
+    return fig, (ax_iq, ax_res), ax_meta
 
 
 
 
 
-
-
-
-'''
-This is where I am going to put new stuff before I pass through the code above
-to make a new version of the plotting code.
-
-
-
-
-
-'''        
